@@ -2,7 +2,7 @@ class Alphabet:
     def __init__(self, tokens, n_unknowns):
         # The (n) most common unknown tokens
         # in a given document, sorted
-        for n in range(n_unknonws):
+        for n in range(n_unknowns):
             tokens.append('__UNK_%d__' % n)
 
         # Any other unknown token
