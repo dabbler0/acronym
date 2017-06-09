@@ -6,8 +6,8 @@ import pickle
 import numpy
 
 class Corpus:
-    def __init__(docs, embeddings, seq_length, batch_size)):
-        self.docs = list(filter(lambda x: len(x) > seq_length, docs))
+    def __init__(self, docs, seq_length, batch_size):
+        self.docs = list(filter(lambda x: len(x) > seq_length + 1, docs))
         self.doc_lengths = list(map(lambda x: len(x), self.docs))
 
         t = sum(self.doc_lengths)
@@ -23,15 +23,21 @@ class Corpus:
             document_index = numpy.random.choice(len(self.docs), p=self.doc_p)
             index = numpy.random.choice(len(self.docs[document_index]) - seq_length - 1)
 
+            self.indices.append((document_index, index))
+
     # Returns batch_input (tensor), batch_labels (tensor), reset (array),
     # where reset[i] is true if you need to reset the hidden inputs on
     # the i(th) minibatch.
     def next_batch(self):
+        seq_length, batch_size = self.seq_length, self.batch_size
+
         batch_input = numpy.zeros(
-            (self.seq_length, self.batch_size)
+            (seq_length, batch_size),
+            dtype='int32'
         )
         batch_labels = numpy.zeros(
-            (self.seq_length, self.batch_size)
+            (seq_length, batch_size),
+            dtype='int32'
         )
         reset = [False for _ in range(batch_size)]
 
@@ -41,7 +47,7 @@ class Corpus:
             # don't, and jump to another random document instead
             if p + seq_length + 1 > len(self.docs[d]):
                 d = numpy.random.choice(len(self.docs), p=self.doc_p)
-                p = numpy.random.choice(len(self.docs[document_index]) - seq_length - 1)
+                p = numpy.random.choice(len(self.docs[d]) - seq_length - 1)
                 reset[i] = True
 
             # Populate the batch input with the given sequence
