@@ -62,126 +62,130 @@ else:
         ).astype(theano.config.floatX) for _ in range(alphabet.size)
     )]
 
-input_matrix, initial_hidden, result_vars, hidden_vars = model.unroll(seq_length)
+def run_training(model=None, embeddings=None, corpus=None, alphabet=None, lr=0.05):
 
+    batch_size = corpus.batch_size
+    seq_legnth = corpus.seq_length
 
-# Cost
-output_labels = T.imatrix('y')
-cost = T.nnet.categorical_crossentropy(T.nnet.softmax(result_vars[0]), output_labels[0])
-for i in range(1, seq_length):
-    cost += T.nnet.categorical_crossentropy(T.nnet.softmax(result_vars[i]), output_labels[i])
-cost /= seq_length
-cost = T.mean(cost)
+    input_matrix, initial_hidden, result_vars, new_hidden = model.unroll(seq_length)
 
-# Training function
-train_fun = theano.function(
-    [output_labels, input_matrix, initial_hidden],
-    [
-        # Input grad, for accumulation to adjust embeddings
-        T.grad(cost, input_matrix),
+    # Cost
+    output_labels = T.imatrix('y')
+    cost = T.nnet.categorical_crossentropy(T.nnet.softmax(result_vars[0]), output_labels[0])
+    for i in range(1, seq_length):
+        cost += T.nnet.categorical_crossentropy(T.nnet.softmax(result_vars[i]), output_labels[i])
+    cost /= seq_length
+    cost = T.mean(cost)
 
-        # Four gates:
-        T.grad(cost, model.reset_gate),
-        T.grad(cost, model.update_gate),
-        T.grad(cost, model.create_gate),
-        T.grad(cost, model.output_gate),
+    # Training function
+    train_fun = theano.function(
+        [output_labels, input_matrix, initial_hidden],
+        [
+            # Input grad, for accumulation to adjust embeddings
+            T.grad(cost, input_matrix),
 
-        # New hidden states:
-        hidden_vars[seq_length],
+            # Four gates:
+            T.grad(cost, model.reset_gate),
+            T.grad(cost, model.update_gate),
+            T.grad(cost, model.create_gate),
+            T.grad(cost, model.output_gate),
 
-        # Loss:
-        cost
-    ]
-)
+            # New hidden states:
+            new_hidden,
 
-def train(inputs, outputs, resets, current_hiddens):
-    # Reset current hiddens as necessary
-    for i, r in enumerate(resets):
-        if r:
-            current_hiddens[i] = numpy.zeros(hidden_size, dtype=theano.config.floatX)
-
-    # Create embedded input
-    input_embeddings = numpy.zeros((seq_length, batch_size, embedding_size), dtype=theano.config.floatX)
-    for i in range(seq_length):
-        for j in range(batch_size):
-            input_embeddings[i][j] = embeddings[inputs[i][j]]
-
-    # Compute:
-    (input_grad, reset_grad,
-        update_grad, create_grad,
-        output_grad, new_hiddens,
-        loss) = train_fun(outputs, input_embeddings, current_hiddens)
-
-    # Update parameters:
-    model.reset_gate.set_value(
-        model.reset_gate.get_value() - lr * reset_grad
-    )
-    model.update_gate.set_value(
-        model.update_gate.get_value() - lr * update_grad
-    )
-    model.create_gate.set_value(
-        model.create_gate.get_value() - lr * create_grad
-    )
-    model.output_gate.set_value(
-        model.output_gate.get_value() - lr * output_grad
+            # Loss:
+            cost
+        ]
     )
 
-    # Update embeddings
-    for i, ns in enumerate(inputs):
-        for j, n in enumerate(ns):
-            embeddings[n] -= lr * input_grad[i][j]
+    def train(inputs, outputs, resets, current_hiddens):
+        # Reset current hiddens as necessary
+        for i, r in enumerate(resets):
+            if r:
+                current_hiddens[i] = numpy.zeros(hidden_size, dtype=theano.config.floatX)
 
-    # Return loss and new hiddens
-    return loss, new_hiddens
+        # Create embedded input
+        input_embeddings = numpy.zeros((seq_length, batch_size, embedding_size), dtype=theano.config.floatX)
+        for i in range(seq_length):
+            for j in range(batch_size):
+                input_embeddings[i][j] = embeddings[inputs[i][j]]
 
-singleton = model.singleton()
-def sample(length, hidden, index):
-    results = []
-    for i in range(length):
-        embedding = embeddings[index]
-        hidden, indices = singleton(hidden, embedding)
-        indices = numpy.ndarray.flatten(indices)
-        # Apply softmax by hand
-        indices = numpy.exp(indices)
-        indices = indices / indices.sum()
-        # Choice
-        index = numpy.random.choice(len(indices), p = indices)
+        # Compute:
+        (input_grad, reset_grad,
+            update_grad, create_grad,
+            output_grad, new_hiddens,
+            loss) = train_fun(outputs, input_embeddings, current_hiddens)
 
-        results.append(index)
+        # Update parameters:
+        model.reset_gate.set_value(
+            model.reset_gate.get_value() - lr * reset_grad
+        )
+        model.update_gate.set_value(
+            model.update_gate.get_value() - lr * update_grad
+        )
+        model.create_gate.set_value(
+            model.create_gate.get_value() - lr * create_grad
+        )
+        model.output_gate.set_value(
+            model.output_gate.get_value() - lr * output_grad
+        )
 
-    return list(map(lambda x: alphabet.to_token(x), results))
+        # Update embeddings
+        for i, ns in enumerate(inputs):
+            for j, n in enumerate(ns):
+                embeddings[n] -= lr * input_grad[i][j]
 
-# Training loop
-smooth_loss = None
-current_hiddens = numpy.zeros((batch_size, hidden_size), dtype=theano.config.floatX)
-for epoch in range(epochs):
-    inputs, outputs, resets = corpus.next_batch()
+        # Return loss and new hiddens
+        return loss, new_hiddens
 
-    #print(outputs)
+    singleton = model.singleton()
+    def sample(length, hidden, index):
+        results = []
+        for i in range(length):
+            embedding = embeddings[index]
+            hidden, indices = singleton(hidden, embedding)
+            indices = numpy.ndarray.flatten(indices)
+            # Apply softmax by hand
+            indices = numpy.exp(indices - numpy.max(indices))
+            indices = indices / indices.sum()
+            # Choice
+            index = numpy.random.choice(len(indices), p = indices)
 
-    # Sample
-    if smooth_loss is not None:
-        print('Epoch %d\tLoss %f\t' % (epoch, smooth_loss))
+            results.append(index)
 
-    if epoch % 5000 == 0:
-        with open(os.path.join(arg.out, 'epoch-%d.pkl' % epoch), 'wb') as f:
-            print('Saving checkpoint to', os.path.join(arg.out, 'epoch-%d.pkl' % epoch))
-            pickle.dump((model, embeddings), f)
+        return list(map(lambda x: alphabet.to_token(x), results))
 
-    if epoch % 100 == 0:
-        with open(os.path.join(arg.out, 'training-current.pkl'), 'wb') as f:
-            print('Saving restore point to', os.path.join(arg.out, 'training-current.pkl'))
-            pickle.dump((model, embeddings), f)
-            print('Saved. Sample:')
-            print(' '.join(sample(seq_length, current_hiddens[0], inputs[0][0])))
+    # Training loop
+    smooth_loss = None
+    current_hiddens = numpy.zeros((batch_size, hidden_size), dtype=theano.config.floatX)
+    for epoch in range(epochs):
+        inputs, outputs, resets = corpus.next_batch()
 
-    sys.stdout.flush()
+        #print(outputs)
 
-    loss, current_hiddens = train(inputs, outputs, resets, current_hiddens)
-    if smooth_loss is None:
-        smooth_loss = loss
-    else:
-        smooth_loss = smooth_loss * 0.99 + loss * 0.01
+        # Sample
+        if smooth_loss is not None:
+            print('Epoch %d\tLoss %f\t' % (epoch, smooth_loss))
 
-with open(os.path.join(arg.out, 'final.pkl'), 'wb') as f:
-    pickle.dump((model, embeddings), f)
+        if epoch % 5000 == 0:
+            with open(os.path.join(arg.out, 'epoch-%d.pkl' % epoch), 'wb') as f:
+                print('Saving checkpoint to', os.path.join(arg.out, 'epoch-%d.pkl' % epoch))
+                pickle.dump((model, embeddings), f)
+
+        if epoch % 100 == 0:
+            with open(os.path.join(arg.out, 'training-current.pkl'), 'wb') as f:
+                print('Saving restore point to', os.path.join(arg.out, 'training-current.pkl'))
+                pickle.dump((model, embeddings), f)
+                print('Saved. Sample:')
+                print(' '.join(sample(seq_length, current_hiddens[0], inputs[0][0])))
+
+        sys.stdout.flush()
+
+        loss, current_hiddens = train(inputs, outputs, resets, current_hiddens)
+        if smooth_loss is None:
+            smooth_loss = loss
+        else:
+            smooth_loss = smooth_loss * 0.99 + loss * 0.01
+
+    with open(os.path.join(arg.out, 'final.pkl'), 'wb') as f:
+        pickle.dump((model, embeddings), f)
