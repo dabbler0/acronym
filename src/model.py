@@ -50,14 +50,13 @@ class RNN:
     # If batched is False, inputs here should be a matrix
     # of size seq_length x input_size
     def unroll(self, seq_length, hidden, inputs, batched=True):
-        outputs = []
+        (hiddens, outputs), updates = theano.scan(
+            fn = lambda input_t, hidden_t: self.step(hidden_t, input_t, batched),
+            outputs_info = [hidden, None],
+            sequences = [inputs]
+        )
 
-        for t in range(seq_length):
-            print('Unrolling step', t)
-            hidden, output = self.step(hidden, inputs[t], batched)
-            outputs.append(output)
-
-        return hidden, T.stack(outputs)
+        return hiddens[-1], outputs
 
 # Simple embedding layer that selects a n-dimensional vector
 # for each integer input
