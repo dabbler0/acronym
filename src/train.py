@@ -1,191 +1,178 @@
+# Math
 import theano
 import theano.tensor as T
-from model import GRU
+import numpy
+
+# Model
+from model import *
 from alphabet import Alphabet
 from corpus import Corpus
+
+# Plumbing
 import pickle
 import argparse
 import os
-import numpy
 import sys
 
+# Increase the recursion limit, which is required for
+# gradient compilation
+sys.setrecursionlimit(9999)
+
+# Constant random seed
 numpy.random.seed(0)
 
-parser = argparse.ArgumentParser(description = 'Run language model training.')
-parser.add_argument('--data', dest='data', help='data file to run on')
-parser.add_argument('--alphabet', dest='alphabet', help='alphabet file to run with')
-parser.add_argument('--embedding_size', type=int, dest='embedding_size', help='size of word embedding to use')
-parser.add_argument('--rnn_size', type=int, dest='rnn_size', help='rnn size to use')
-parser.add_argument('--batch_size', type=int, dest='batch_size', help='minibatch size to use')
-parser.add_argument('--seq_length', type=int, dest='seq_length', help='sequence length to use')
-parser.add_argument('--epochs', type=int, dest='epochs', help='number of epochs to run for')
-parser.add_argument('--learning_rate', type=float, dest='learning_rate', help='learning rate')
-parser.add_argument('--resume', dest='resume', help='checkpoint file to resume from')
-parser.add_argument('--out', dest='out', help='output directory (created if not existent)')
+# Command line arguments
+parser=argparse.ArgumentParser(description='Run language model training.')
+
+parser.add_argument('--data', dest='data', help='Data file to run on', required=True)
+parser.add_argument('--alphabet', dest='alphabet', help='Alphabet file to run with', required=True)
+parser.add_argument('--out', dest='out', help='Output directory', required=True)
+
+# Optional model arguments
+parser.add_argument('--embedding_size', type=int, dest='embedding_size', help='Word embedding size', default=300)
+parser.add_argument('--rnn_size', type=int, dest='rnn_size', help='Hidden state size', default=500)
+parser.add_argument('--batch_size', type=int, dest='batch_size', help='Minibatch size', default=50)
+parser.add_argument('--seq_length', type=int, dest='seq_length', help='Sequence length', default=50)
+
+# Optional training arguments
+parser.add_argument('--epochs', type=int, dest='epochs', help='Number of epochs', default=5000 * 13)
+parser.add_argument('--learning_rate', type=float, dest='learning_rate', help='Learning rate for SGD', default=0.05)
+parser.add_argument('--checkpoint_freq', type=int, dest='checkpoint_frequency', help='Save a checkpoint every X epochs', default=5000)
+parser.add_argument('--sample_length', type=int, dest='sample_length', help='Length of sample to take', default=50)
+parser.add_argument('--sample_freq', type=int, dest='sample_frequency', help='Take a sample every X epochs', default=100)
+parser.add_argument('--softmax_temp', type=float, dest='softmax_temperature', help='Softmax temperature for sampling', default=1)
+
 arg = parser.parse_args()
 
-# Load data
-data = None
-alphabet = None
+# Load data and alphabet
 with open(arg.data, 'rb') as f:
     data = pickle.load(f)
+
 with open(arg.alphabet, 'rb') as f:
     alphabet = pickle.load(f)
 
-# Create checkpoint directy if it doesn't
-# already exist
 if not os.path.exists(arg.out):
     os.makedirs(arg.out)
 
+# Unpack arguments
 epochs = arg.epochs
 embedding_size = arg.embedding_size
-hidden_size = arg.rnn_size
+rnn_size = arg.rnn_size
 batch_size = arg.batch_size
 seq_length = arg.seq_length
-lr = arg.learning_rate
+learning_rate = arg.learning_rate
 
+# Create corpus
 corpus = Corpus(data, seq_length, batch_size)
 
 # Create the model
-if arg.resume is not None:
-    print('Resuming!')
-    with open(arg.resume, 'rb') as f:
-        model, embeddings = pickle.load(f)
+embedding_layer = Embedding(alphabet.size, embedding_size)
+gru_layer_1 = GRU(embedding_size, rnn_size, rnn_size)
+gru_layer_2 = GRU(rnn_size, rnn_size, rnn_size)
+output_layer = Output(rnn_size, alphabet.size)
 
-else:
-    model = GRU(embedding_size, hidden_size, alphabet.size)
+forward_network = Composition([embedding_layer, gru_layer_1, gru_layer_2, output_layer])
 
-    # Create word embeddings
-    embeddings = [
-        numpy.random.uniform(
-            size = (arg.embedding_size,)
-        ).astype(theano.config.floatX) for _ in range(alphabet.size)
-    )]
+# Create training-mode model
+true_output = T.imatrix('y') # Will ultimately be seq_length x batch_size
+train_layer = output_layer.create_training_node(batch_size, true_output)
+training_network = Composition([embedding_layer, gru_layer_1, gru_layer_2, train_layer])
 
-def run_training(model=None, embeddings=None, corpus=None, alphabet=None, lr=0.05):
+# Compute gradients
+initial_hidden = tuple(T.matrix('h') for _ in range(training_network.n_hiddens))  # batch_size x rrn_size
+inputs = T.imatrix('x') # seq_length x batch_size
+new_hidden, costs = training_network.unroll(seq_length, initial_hidden, inputs)
+cost = T.mean(costs)
 
-    batch_size = corpus.batch_size
-    seq_legnth = corpus.seq_length
+# Training function, which also updates parameters
+# according to SGD (TODO adam/nesterov momentum)
+print('Compiling training function...')
+training_function = theano.function(
+    (inputs, true_output) + initial_hidden,
+    (cost,) + new_hidden,
+    updates = [
+        (
+            param,
+            param - learning_rate * T.grad(cost, param)
+        ) for param in training_network.params
+    ],
+    mode='FAST_RUN'
+)
+print('Done.')
 
-    input_matrix, initial_hidden, result_vars, new_hidden = model.unroll(seq_length)
+# Training function
+def train(inputs, outputs, hiddens):
+    args = (inputs, outputs) + hiddens
+    result = training_function(*args)
 
-    # Cost
-    output_labels = T.imatrix('y')
-    cost = T.nnet.categorical_crossentropy(T.nnet.softmax(result_vars[0]), output_labels[0])
-    for i in range(1, seq_length):
-        cost += T.nnet.categorical_crossentropy(T.nnet.softmax(result_vars[i]), output_labels[i])
-    cost /= seq_length
-    cost = T.mean(cost)
+    # Loss, new hidden state
+    return result[0], result[1:]
 
-    # Training function
-    train_fun = theano.function(
-        [output_labels, input_matrix, initial_hidden],
-        [
-            # Input grad, for accumulation to adjust embeddings
-            T.grad(cost, input_matrix),
+# Sampling function
+print('Compiling sampling function...')
+singleton = forward_network.create_singleton_function()
+print('Done.')
 
-            # Four gates:
-            T.grad(cost, model.reset_gate),
-            T.grad(cost, model.update_gate),
-            T.grad(cost, model.create_gate),
-            T.grad(cost, model.output_gate),
+# Initialize the hidden state at the beginning of all the samples.
+current_hiddens = (
+    numpy.zeros((batch_size, rnn_size)), # Layer 1
+    numpy.zeros((batch_size, rnn_size)) # Layer 2
+)
+smooth_cost = None
 
-            # New hidden states:
-            new_hidden,
+# Training loop
+print('Beginning training loop.')
+for epoch in range(epochs):
+    # Get the next batch from the corpus
+    inputs, outputs, resets = corpus.next_batch()
 
-            # Loss:
-            cost
-        ]
-    )
+    # Reset any of the samples that wrapped to the beginning
+    # of a document
+    for i in range(batch_size):
+        if resets[i]:
+            for j, layer in enumerate(current_hiddens):
+                # Zero out this particular batch
+                current_hiddens[j][i] = 0
 
-    def train(inputs, outputs, resets, current_hiddens):
-        # Reset current hiddens as necessary
-        for i, r in enumerate(resets):
-            if r:
-                current_hiddens[i] = numpy.zeros(hidden_size, dtype=theano.config.floatX)
+    # Feed inputs and outputs into the training function
+    cost, current_hiddens = train(inputs, outputs, current_hiddens)
 
-        # Create embedded input
-        input_embeddings = numpy.zeros((seq_length, batch_size, embedding_size), dtype=theano.config.floatX)
-        for i in range(seq_length):
-            for j in range(batch_size):
-                input_embeddings[i][j] = embeddings[inputs[i][j]]
+    # Update smooth cost for logging
+    if smooth_cost is None:
+        smooth_cost = cost
+    else:
+        smooth_cost = smooth_cost * 0.01 + 0.99 * cost
 
-        # Compute:
-        (input_grad, reset_grad,
-            update_grad, create_grad,
-            output_grad, new_hiddens,
-            loss) = train_fun(outputs, input_embeddings, current_hiddens)
+    # Log cost
+    print('Epoch %d\tSmooth Loss %f\tLoss %f' % (epoch, smooth_cost, cost))
 
-        # Update parameters:
-        model.reset_gate.set_value(
-            model.reset_gate.get_value() - lr * reset_grad
-        )
-        model.update_gate.set_value(
-            model.update_gate.get_value() - lr * update_grad
-        )
-        model.create_gate.set_value(
-            model.create_gate.get_value() - lr * create_grad
-        )
-        model.output_gate.set_value(
-            model.output_gate.get_value() - lr * output_grad
-        )
+    # Periodically save checkpoints
+    if epoch % arg.checkpoint_frequency == 0:
+        path = os.path.join(arg.out, 'epoch-%d-%f.pk' % (epoch, smooth_cost))
+        with open(path, 'wb') as f:
+            print('Saving checkpoint to %s' % path)
+            pickle.dump(forward_network, f)
 
-        # Update embeddings
-        for i, ns in enumerate(inputs):
-            for j, n in enumerate(ns):
-                embeddings[n] -= lr * input_grad[i][j]
+    # Periodically sample on batch 0
+    if epoch % arg.sample_frequency == 0:
+        tokens = []
+        next_token = outputs[0][-1] # Last next token of batch 0
+        hiddens = current_hiddens[0]
+        for t in range(arg.sample_length):
+            predictions, hiddens = singleton(next_token, hiddens)
 
-        # Return loss and new hiddens
-        return loss, new_hiddens
+            # Softmax to get the token given the prediction
+            if arg.softmax_temperature == 0:
+                next_token = numpy.argmax(predictions)
+            else:
+                # Apply softmax temperature
+                predictions = predictions ** (1 / arg.softmax_temperature)
+                predictions /= predictions.sum()
 
-    singleton = model.singleton()
-    def sample(length, hidden, index):
-        results = []
-        for i in range(length):
-            embedding = embeddings[index]
-            hidden, indices = singleton(hidden, embedding)
-            indices = numpy.ndarray.flatten(indices)
-            # Apply softmax by hand
-            indices = numpy.exp(indices - numpy.max(indices))
-            indices = indices / indices.sum()
-            # Choice
-            index = numpy.random.choice(len(indices), p = indices)
+                # Choose probabilistically
+                next_token = numpy.random.choice(len(predictions), p = predictions)
 
-            results.append(index)
+            tokens.append(next_tokens)
 
-        return list(map(lambda x: alphabet.to_token(x), results))
-
-    # Training loop
-    smooth_loss = None
-    current_hiddens = numpy.zeros((batch_size, hidden_size), dtype=theano.config.floatX)
-    for epoch in range(epochs):
-        inputs, outputs, resets = corpus.next_batch()
-
-        #print(outputs)
-
-        # Sample
-        if smooth_loss is not None:
-            print('Epoch %d\tLoss %f\t' % (epoch, smooth_loss))
-
-        if epoch % 5000 == 0:
-            with open(os.path.join(arg.out, 'epoch-%d.pkl' % epoch), 'wb') as f:
-                print('Saving checkpoint to', os.path.join(arg.out, 'epoch-%d.pkl' % epoch))
-                pickle.dump((model, embeddings), f)
-
-        if epoch % 100 == 0:
-            with open(os.path.join(arg.out, 'training-current.pkl'), 'wb') as f:
-                print('Saving restore point to', os.path.join(arg.out, 'training-current.pkl'))
-                pickle.dump((model, embeddings), f)
-                print('Saved. Sample:')
-                print(' '.join(sample(seq_length, current_hiddens[0], inputs[0][0])))
-
-        sys.stdout.flush()
-
-        loss, current_hiddens = train(inputs, outputs, resets, current_hiddens)
-        if smooth_loss is None:
-            smooth_loss = loss
-        else:
-            smooth_loss = smooth_loss * 0.99 + loss * 0.01
-
-    with open(os.path.join(arg.out, 'final.pkl'), 'wb') as f:
-        pickle.dump((model, embeddings), f)
+        print('Sample:')
+        print(' '.join(alphabet.to_token(token) for token in tokens))

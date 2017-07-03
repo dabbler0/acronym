@@ -1,40 +1,114 @@
+import math
 import theano
 import theano.tensor as T
 import numpy
 
-class Embedding(self, alphabet_size, embedding_size):
+# An RNNUnit
+class RNN:
     def __init__(self):
-        self.embedding_values = numpy.random.uniform(
-              size = (alphabet.size, arg.embedding_size)
-          ).astype(theano.config.floatX)
+        self.params = []
+        self.n_hiddens = 0
 
-        self.update_gate = theano.shared(
+    # hidden_state: tuple of T.tensors
+    # input: a T.tensor
+    # batched: True if this is being run in minibatch mode
+    def step(self, hidden_state, input, batched):
+        raise Exception('Not implemented.')
+        # return hidden_state, output
+        # hidden_state: list of T.tensors
+        # output: a T.tensor
+
+    def input_prototype(self):
+        return T.vector('x')
+
+    def create_singleton_function(self):
+        hidden = tuple(T.vector('h') for i in range(self.n_hiddens))
+        input = self.input_prototype()
+
+        # Step
+        new_hidden, output = self.step(hidden, input, False)
+
+        # Make a function
+        f = theano.function(
+            (input,) + hidden,
+            (output,) + new_hidden
+        )
+
+        # Package it nicely
+        def singleton(input, hidden):
+            result = f(input, hidden)
+            output, new_hidden = result[0], result[1:]
+
+            return output, new_hidden
+
+        # Return
+        return singleton
+
+
+    # If batched is True, inputs here should be a tensor3
+    # of size seq_length x batch_size x input_size
+    # If batched is False, inputs here should be a matrix
+    # of size seq_length x input_size
+    def unroll(self, seq_length, hidden, inputs, batched=True):
+        outputs = []
+
+        for t in range(seq_length):
+            print('Unrolling step', t)
+            hidden, output = self.step(hidden, inputs[t], batched)
+            outputs.append(output)
+
+        return hidden, T.stack(outputs)
+
+# Simple embedding layer that selects a n-dimensional vector
+# for each integer input
+class Embedding(RNN):
+    def __init__(self, alphabet_size, embedding_size):
+        self.embedding_values = numpy.random.uniform(
+            size = (alphabet_size, embedding_size)
+        ).astype(theano.config.floatX)
+
+        self.embedding = theano.shared(
             value = self.embedding_values,
             name = 'E',
             borrow = True
         )
 
-    def singleton(self):
-        hidden, input = T
+        self.params = [
+            self.embedding
+        ]
 
-    def unroll_one_step_nonbatched(self, hidden, input):
-        return hidden, self.embeddings[input]
+        self.n_hiddens = 0
 
-    # An Embedding layer doesn't actually have a hidden state,
-    # so we just pass the hidden state directly through.
-    def unroll_one_step_batched(self, hidden, input):
-        return hidden, self.embeddings[input]
+    def input_prototype(self):
+        return T.iscalar('x')
 
-class GRU:
+    # Embedding does not have any hidden state.
+    def step(self, hidden_state, input, batched):
+        return hidden_state, self.embedding[input]
+
+# A GRU
+class GRU(RNN):
     def __init__(self, input_size, hidden_size, output_size):
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+
         # Define to-insert matrix
         self.update_gate_values = numpy.random.normal(
             scale = 1 / (hidden_size + input_size),
-            size = (hidden_size + input_size, hidden_size),
+            size = (hidden_size + input_size, hidden_size)
         ).astype(theano.config.floatX)
         self.update_gate = theano.shared(
             value = self.update_gate_values,
             name = 'U',
+            borrow = True
+        )
+
+        # Define insert bias
+        self.update_bias_values = numpy.zeros(hidden_size, dtype=theano.config.floatX)
+        self.update_bias = theano.shared(
+            value = self.update_bias_values,
+            name = 'u',
             borrow = True
         )
 
@@ -49,6 +123,14 @@ class GRU:
             borrow = True
         )
 
+        # Define hidden bias
+        self.create_bias_values = numpy.zeros(hidden_size, dtype=theano.config.floatX)
+        self.create_bias = theano.shared(
+            value = self.create_bias_values,
+            name = 'c',
+            borrow = True
+        )
+
         # Define to-reset matrix
         self.reset_gate_values = numpy.random.normal(
             scale = 1 / (hidden_size + input_size),
@@ -57,6 +139,14 @@ class GRU:
         self.reset_gate = theano.shared(
             value = self.reset_gate_values,
             name = 'R',
+            borrow = True
+        )
+
+        # Define to-reset bias
+        self.reset_bias_values = numpy.zeros(hidden_size, dtype=theano.config.floatX)
+        self.reset_bias = theano.shared(
+            value = self.reset_bias_values,
+            name = 'r',
             borrow = True
         )
 
@@ -71,152 +161,200 @@ class GRU:
             borrow = True
         )
 
+        # Define output bias
+        self.output_bias_values = numpy.zeros(output_size, dtype=theano.config.floatX)
+        self.output_bias = theano.shared(
+            value = self.output_bias_values,
+            name = 'o',
+            borrow = True
+        )
+
         # Pack params together
         self.params = [
             self.output_gate,
             self.create_gate,
             self.reset_gate,
-            self.update_gate
+            self.update_gate,
+
+            self.output_bias,
+            self.create_bias,
+            self.reset_bias,
+            self.update_bias
         ]
 
-    # Create a theano function that can be called
-    # on a single hidden state + input index
-    # to produce a distribution and another hidden state.
-    #
-    # To be used for forward-only passes.
-    def singleton(self):
-        hidden_state = T.vector('h')
-        input_vector = T.vector('x')
+        self.n_hiddens = 1
 
-        output, new_hidden = self.unroll_one_step_nonbatched(
-            hidden_state, input_vector
-        )
+    # hidden_state should be an array that contains a single
+    # tensor.
+    def step(self, hidden_state, input, batched):
+        # The primary axis is the axis of state dimensions
+        primary_axis = 1 if batched else 0
 
-        return theano.function(
-            [hidden_state, input_vector],
-            [new_hidden, output]
-        )
+        # Unpack hidden state from single-element array
+        (hidden,) = hidden_state
 
-    def unroll_one_step_nonbatched(self, hidden, input):
         # hidden has size batch_size x hidden_size
         # input has size batch_size x input_size
-        all_info = T.concatenate([hidden, input], axis=0)
+        all_info = T.concatenate([hidden, input], axis=primary_axis)
 
-        reset = T.nnet.sigmoid(T.dot(all_info, self.reset_gate))
-        update = T.nnet.sigmoid(T.dot(all_info, self.update_gate))
-
-        # Reset some hidden things
-        reset_info = T.concatenate([reset * hidden, input], axis=0)
-
-        # Update
-        created = T.tanh(T.dot(reset_info, self.create_gate))
-        new_hidden = update * created + (1 - update) * hidden
-        output = T.dot(new_hidden, self.output_gate)
-
-        return output, new_hidden
-
-    def unroll_one_step_batched(self, hidden, input):
-        # hidden has size batch_size x hidden_size
-        # input has size batch_size x input_size
-        all_info = T.concatenate([hidden, input], axis=1)
-
-        reset = T.nnet.sigmoid(T.dot(all_info, self.reset_gate))
-        update = T.nnet.sigmoid(T.dot(all_info, self.update_gate))
+        reset = T.nnet.sigmoid(T.dot(all_info, self.reset_gate) + self.reset_bias)
+        update = T.nnet.sigmoid(T.dot(all_info, self.update_gate) + self.update_bias)
 
         # Reset some hidden things
-        reset_info = T.concatenate([reset * hidden, input], axis=1)
+        reset_info = T.concatenate([reset * hidden, input], axis=primary_axis)
 
         # Update
-        created = T.tanh(T.dot(reset_info, self.create_gate))
+        created = T.tanh(T.dot(reset_info, self.create_gate) + self.create_bias)
         new_hidden = update * created + (1 - update) * hidden
-        output = T.dot(new_hidden, self.output_gate)
+        output = T.tanh(T.dot(new_hidden, self.output_gate) + self.output_bias)
 
-        return output, new_hidden
+        return (new_hidden,), output
 
-    # Create a theano function that accepts an entire minibatch
-    # matrix and does a training pass on it.
-    #
-    # To be used for training passes.
-    def unroll(self, seq_length):
-        # Input matrix is an 3d array of word embeddings
-        # of size seq_length x batch_size x input_size
-        input_matrix = T.tensor3('x')
-        initial_hidden_matrix = T.matrix('h')
+class Output(RNN):
+    def __init__(self, input_size, output_size):
+        self.input_size = input_size
+        self.output_size = output_size
 
-        # Resulting output distributions
-        result_variables = []
-        current_hidden = initial_hidden_matrix
+        # Approximately sqrt the output size
+        intermediate_size = int(output_size ** 0.5)
+        self.intermediate_size = intermediate_size
+        self.outputs_per_class = math.ceil(output_size / intermediate_size)
 
-        # Unroll (i) times
-        for i in range(seq_length):
-            output, current_hidden = self.unroll_one_step_batched(
-                current_hidden,
-                input_matrix[i]
+        # SoftmaxH values
+        self.first_level_values = numpy.random.normal(
+            scale = 1 / (input_size),
+            size = (input_size, intermediate_size)
+        ).astype(theano.config.floatX)
+        self.first_level = theano.shared(
+            value = self.first_level_values,
+            name = 'W1',
+            borrow = True
+        )
+
+        self.first_level_bias_values = numpy.zeros(intermediate_size, dtype=theano.config.floatX)
+        self.first_level_bias = theano.shared(
+            value = self.first_level_bias_values,
+            name = 'b1',
+            borrow = True
+        )
+
+        self.second_level_values = numpy.random.normal(
+            scale = 1 / (input_size),
+            size = (intermediate_size, input_size, self.outputs_per_class)
+        ).astype(theano.config.floatX)
+        self.second_level = theano.shared(
+            value = self.second_level_values,
+            name = 'W2',
+            borrow = True
+        )
+
+        self.second_level_bias_values = numpy.zeros(
+            (intermediate_size, self.outputs_per_class),
+            dtype=theano.config.floatX
+        )
+        self.second_level_bias = theano.shared(
+            value = self.second_level_bias_values,
+            name = 'b1',
+            borrow = True
+        )
+
+        self.params = [
+            self.first_level,
+            self.first_level_bias,
+            self.second_level,
+            self.second_level_bias,
+        ]
+
+        self.n_hiddens = 0
+
+    def create_training_node(self, batch_size, truth_variable):
+        return TrainingNode(self, batch_size, truth_variable)
+
+    def step(self, hidden_state, input, batched):
+        # Predict class probabilities
+        class_probs = T.nnet.softmax(T.dot(input, self.first_level) + self.first_level_bias)
+
+        # For each class, predict output probabilities
+        output_prob_list = []
+        for i in range(self.intermediate_size):
+            output_prob_list.append(
+                class_probs[i] * T.nnet.softmax(
+                    T.dot(input, self.second_level[i]) + self.second_level_bias[i]
+                )
             )
 
-            result_variables.append(output)
+        output_probs = T.stack(output_prob_list)
 
-        return input_matrix, initial_hidden_matrix, result_variables, current_hidden
+        # Get rid of excess probabilities and renormalize
+        if batched:
+            output_probs = output_probs[:, :self.output_size]
+            output_probs /= output_probs.sum(1)
+        else:
+            output_probs = output_probs[:self.output_size]
+            output_probs /= output_probs.sum()
 
-class StackedRNN:
-    def __init__(self, layers, nonlinearity = T.nnet.relu):
+        # Return
+        return hidden_state, output_probs
+
+class TrainingNode(RNN):
+    def __init__(self, output_node, batch_size, truth_variable):
+        self.outputs_per_class = output_node.outputs_per_class
+        self.first_level = output_node.first_level
+        self.first_level_bias = output_node.first_level_bias
+        self.second_level = output_node.second_level
+        self.second_level_bias = output_node.second_level_bias
+
+        self.truth_variable = truth_variable
+        self.batch_size = batch_size
+
+        self.params = output_node.params
+        self.n_hiddens = 0
+
+    def step(self, hidden_state, input, batched):
+        if not batched:
+            raise Exception('TrainingNode should only be used for training, and in batch mode')
+
+        class_probs = T.nnet.softmax(T.dot(input, self.first_level) + self.first_level_bias)
+        which_class = self.truth_variable // self.outputs_per_class
+        which_postclass_index = self.truth_variable % self.outputs_per_class
+
+        costs = []
+
+        for i in range(self.batch_size):
+            probs = class_probs[which_class[i]] * T.nnet.softmax(
+                T.dot(input[i], self.second_level[which_class[i]]) + self.second_level_bias[which_class[i]]
+            )
+
+            target_prob = probs[which_postclass_index[i]]
+
+            # Cross entropy
+            costs.append(-T.log(target_prob))
+
+        # Take mean over minibatches
+        return hidden_state, (sum(costs) / len(costs))
+
+# A stacked RNN of several other RNNs
+class Composition(RNN):
+    def __init__(self, layers):
         self.layers = layers
-        self.nonlinearity = nonlinearity
+        self.params = sum((x.params for x in layers), [])
+        self.n_hiddens = sum(x.n_hiddens for x in layers)
 
-        _x = T.vector('x')
-        self.apply_nonlinearity = theano.function(x, nonlinearity(x))
+    def input_prototype(self):
+        return self.layers[0].input_prototype()
 
-        self.params = sum(layer.params for layer in layers)
+    def step(self, hidden_state, input, batched):
+        new_hidden_state = []
 
-    # Singleton that manually evaluates a single
-    # forward run.
-    def singleton(self):
-        layer_functions = []
-        for layer in self.layers:
-            layer_functions.append(layer.singleton())
+        h_index = 0
+        for i, layer in enumerate(self.layers):
+            next_h_index = h_index + layer.n_hiddens
+            new_hidden, input = layer.step(
+                hidden_state[h_index:next_h_index],
+                input,
+                batched
+            )
+            h_index = next_h_index
+            new_hidden_state.extend(new_hidden)
 
-        def run_forward(hiddens, current_input):
-            current_output = None
-            new_hiddens = []
-            for i, fn in enumerate(layer_functions):
-                new_hidden, current_output = fn(hiddens[i], current_input)
-                new_hiddens.append(new_hidden)
-                current_input = self.apply_nonlinearity(current_output)
-
-        pass
-            return numpy.stack(new_hiddens), current_input
-
-        return run_forward
-
-    # Unroll to a given sequence length.
-    def unroll(self, seq_length):
-        # Input matrix is an 3d array of word embeddings
-        # of size seq_length x batch_size x input_size
-        input_matrix = T.tensor3('x')
-
-        # Hidden matrices are a 2d array of hidden states
-        # of size layers x hidden_size
-        initial_hidden_matrices = T.matrix('h')
-
-        current_inputs = input_matrix
-        current_outputs = None
-        new_hiddens = []
-
-        # Advance layers one at a time.
-        for i, layer in enumerate(layers):
-            current_hidden = initial_hidden_matrices[i]
-            current_outputs = []
-
-            # Unroll (i) times
-            for i in range(seq_length):
-                output, current_hidden = self.unroll_one_step_batched(
-                    current_hidden,
-                    current_inputs[i]
-                )
-
-                current_outputs.append(output)
-
-            new_hiddens.append(current_hidden)
-            current_inputs = [self.nonlinearity(value) for value in current_outputs]
-
-        return input_matrix, initial_hidden_matrices, current_outputs, new_hiddens
+        return tuple(new_hidden_state), input

@@ -7,7 +7,7 @@ import numpy
 class RNN:
     def __init__(self):
         self.params = []
-        self.n_hiddens = []
+        self.n_hiddens = 0
 
     # hidden_state: tuple of T.tensors
     # input: a T.tensor
@@ -34,9 +34,9 @@ class RNN:
 # Simple embedding layer that selects a n-dimensional vector
 # for each integer input
 def Embedding(RNN):
-    def __init__(self):
+    def __init__(self, alphabet_size, embedding_size):
         self.embedding_values = numpy.random.uniform(
-              size = (alphabet.size, arg.embedding_size)
+              size = (alphabet_size, embedding_size)
           ).astype(theano.config.floatX)
 
         self.embedding = theano.shared(
@@ -45,20 +45,15 @@ def Embedding(RNN):
             borrow = True
         )
 
-        self.n_hiddens = 0
-
         self.params = [
             self.embedding
         ]
 
+        self.n_hiddens = 0
+
     # Embedding does not have any hidden state.
     def step(self, hidden_state, input, batched):
         return hidden_state, self.embedding[input]
-
-def SoftmaxH(RNN):
-    def __init__(self):
-        # TODO impelement SoftmaxH
-        self.params = []
 
 # A GRU
 def GRU(RNN):
@@ -234,13 +229,14 @@ def Output(RNN):
             borrow = True
         )
 
-        self.n_hiddens = 0
         self.params = [
             self.first_level,
             self.first_level_bias,
             self.second_level,
             self.second_level_bias,
         ]
+
+        self.n_hiddens = 0
 
     def create_training_node(self, batch_size, truth_variable):
         return TrainingNode(self, batch_size, truth_variable)
@@ -321,33 +317,3 @@ class Composition(RNN):
             new_hidden, input = layer.step(hidden_state[i], input)
             new_hidden_state.append(new_hidden)
         return tuple(new_hidden_state), input
-
-
-# EXAMPLE OF HOW TO TRAIN
-
-embedder = Embedding(alphabet_size, embedding_size)
-layer1 = GRU(embedding_size, hidden_size, embedding_size)
-layer2 = GRU(embedding_size, hidden_size, embedding_size)
-output = Output(embedding_size, alphabet_size)
-train_ouput = output.create_training_node()
-
-training_network = Composition([embedder, layer1, layer2, train_output])
-forward_network = Composition([embedder, layer1, layer2, output])
-
-# Create training function
-
-inputs = T.matrix('x')
-hiddens = [T.matrix('h') for _ in range(training_network.n_hiddens)]
-new_hiddens, outputs = training_network.unroll(seq_length, hiddens, inputs)
-cost = sum(outputs) / len(outputs)
-
-train_fun = theano.function(
-    [hiddens, inputs],
-    [new_hiddens, cost],
-    updates = [
-        (param, param - lr * T.grad(cost, param)) for param in training_network.params
-    ]
-)
-
-for epoch in range(epochs):
-    train_fun(hiddens, inputs)
